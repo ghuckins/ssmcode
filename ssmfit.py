@@ -1,52 +1,150 @@
 import autograd.numpy as np
 import autograd.numpy.random as npr
-npr.seed(0)
-
 import ssm
 from ssm.util import random_rotation
 
-def generate_sample_data(outdim, latentdim1, k1, latentdim2, k2,t):
-    slds1 = ssm.SLDS(outdim, k1, latentdim1, transitions="recurrent_only", dynamics="diagonal_gaussian", emissions="gaussian_orthog", single_subspace=True)
-    for k in range(k1):
-        slds1.dynamics.As[k] = .95 * random_rotation(latentdim1, theta=(k + 1) * np.pi / 20)
-    slds2 = ssm.SLDS(outdim, k2, latentdim2, transitions="recurrent_only", dynamics="diagonal_gaussian", emissions="gaussian_orthog", single_subspace=True)
-    for k in range(k2):
-        slds2.dynamics.As[k] = .95 * random_rotation(latentdim2, theta=(k + 1) * np.pi / 20)
-    z,x,y1 = slds1.sample(t)
-    z,x,y2 = slds2.sample(t)
-    return y1,y2
 
-def train_ssm(train,outdim,latentdims,ks,numits):
-    size = np.shape(train)[0]
-    maxelbo = -100000000000000000000
+def generate_sample_data(outdim,
+                         n_latent_dimensions,
+                         n_discrete_states,
+                         n_timepoints,
+                         mystery_param_95=.95,
+                         mystery_param_20=20):
+
+    slds = ssm.SLDS(
+        outdim, 
+        n_discrete_states,
+        n_latent_dimensions,
+        transitions="recurrent_only",
+        dynamics="diagonal_gaussian",
+        emissions="gaussian_orthog",
+        single_subspace=True)
+
+    # TBD: generate parameters outside of slds()
+    # so that they can be reused and saved
+    for k in range(n_discrete_states):
+        slds.dynamics.As[k] = mystery_param_95 * random_rotation(
+            n_latent_dimensions, theta=(k + 1) * np.pi / mystery_param_20)
+
+    _, _, output_emissions = slds.sample(n_timepoints)
+
+    return output_emissions
+
+
+def train_ssm(training_data, outdim,
+              max_latent_dimensions=5,
+              max_discrete_states=8,
+              n_iterations=50,
+              n_cv_iterations=10,
+              training_proportion=.9):
+    n_training_points = training_data.shape[0]
+    maxelbo = -1e16
     bestk = 0
     bestl = 0
-    for l in latentdims:
-        for k in ks:
+
+    for n_latent_dims in range(1, max_latent_dimensions + 1):
+        for n_disc_states in range(1, max_discrete_states + 1):
             avgelbo = 0
-            slds = ssm.SLDS(outdim,k,l,transitions="recurrent_only", dynamics="diagonal_gaussian", emissions="gaussian_orthog", single_subspace=True)
-            for i in range(10):
-                np.random.shuffle(train)
-                slds.fit(train[:int(.9*size),:],method="laplace_em",variational_posterior="structured_meanfield",num_iters=numits, alpha=0.0)
-                elbo,posterior = slds.approximate_posterior(train[int(.9*size):,:],method="laplace_em",variational_posterior="structured_meanfield",num_iters=numits)
-                avgelbo = (avgelbo*i + elbo[numits])/(i+1)
+            slds = ssm.SLDS(
+                outdim,
+                n_disc_states,
+                n_latent_dims,
+                transitions="recurrent_only",
+                dynamics="diagonal_gaussian",
+                emissions="gaussian_orthog", 
+                single_subspace=True)
+            # shuffle split CV
+            elbos = []
+            for _ in range(n_cv_iterations):
+                np.random.shuffle(training_data)
+                slds.fit(
+                    training_data[:int(
+                        training_proportion * n_training_points), :],
+                    method="laplace_em",
+                    variational_posterior="structured_meanfield",
+                    num_iters=n_iterations,
+                    alpha=0.0)
+                elbo, posterior = slds.approximate_posterior(
+                    training_data[int(training_proportion * n_training_points):, :],
+                    method="laplace_em",
+                    variational_posterior="structured_meanfield",
+                    num_iters=n_iterations)
+                elbos.append(elbo[-1])
+
+            avgelbo = np.mean(elbos)
             if avgelbo > maxelbo:
                 maxelbo = avgelbo
-                bestk = k
-                bestl = l
-    slds = ssm.SLDS(outdim, bestk, bestl, transitions="recurrent_only", dynamics="diagonal_gaussian", emissions="gaussian_orthog", single_subspace=True)
-    return slds
+                bestk = n_disc_states
+                bestl = n_latent_dims
 
-def test_ssm(slds1,slds2,test,numits):
-    elbo1 = slds1.approximate_posterior(test,method="laplace_em",variational_posterior="structured_meanfield",num_iters=numits)
-    elbo2 = slds2.approximate_posterior(test,method="laplace_em",variational_posterior="structured_meanfield",num_iters=numits)
-    if elbo1[50] > elbo2[50]:
+    # create instance of model with best parameters
+    return(ssm.SLDS(
+        outdim,
+        bestk,
+        bestl,
+        transitions="recurrent_only", dynamics="diagonal_gaussian", emissions="gaussian_orthog", single_subspace=True))
+
+
+def test_ssm(slds_models, testdata, n_iterations):
+    elbo1 = slds_models[0].approximate_posterior(
+        testdata,
+        method="laplace_em",
+        variational_posterior="structured_meanfield",
+        num_iters=n_iterations)
+    elbo2 = slds_models[1].approximate_posterior(
+        testdata,
+        method="laplace_em",
+        variational_posterior="structured_meanfield",
+        num_iters=n_iterations)
+
+    if elbo1[-1] > elbo2[-1]:
         print("The first model gives the best fit")
     else:
         print("The second model gives the best fit")
+    return({'elbo1': elbo1, 'elbo2': elbo2})
 
 
-data1,data2 = generate_sample_data(10,2,5,2,5,1000)
-slds1 = train_ssm(data1[:900,:],10,range(1,5),range(1,8),50)
-slds2 = train_ssm(data2[:900,:],10,range(1,5),range(1,8),50)
-test_ssm(slds1,slds2,data1[900:,:])
+if __name__ == '__main__':
+
+    fix_random_seed = False
+    if fix_random_seed:
+        npr.seed(0)
+
+    n_latent_dimensions = [2, 2]
+    n_discrete_states = [5, 5]
+    outdim = 10
+    n_timepoints = 2000
+    p_training_data = 0.5
+    training_cutoff = np.round(n_timepoints * p_training_data)
+
+    data = {}
+    slds = {}
+    n_datasets = 2
+
+    max_latent_dimensions = 5
+    max_discrete_states = 8
+    n_iterations = 50
+
+    dataset_names = ['simple', 'complex']
+    for i, dname in enumerate(dataset_names):
+        print(f'processing {dname}')
+        # generate random params
+        params[dname] = get_random_params(...)  # TBD
+
+        data[dname] = generate_sample_data(
+            outdim,
+            n_latent_dimensions[i],
+            n_discrete_states[i],
+            n_timepoints,
+            params[dname])
+
+        slds[dname] = train_ssm(
+            data[dname][:training_cutoff,:],
+            outdim)
+
+    test_output = {
+        dname: test_ssm(
+            [slds['simple'], slds['complex']], data[dname][training_cutoff:, :]
+        )
+        for i, dname in enumerate(dataset_names)
+    }
